@@ -146,6 +146,32 @@ class PaymentReversalIn(BaseModel):
     payment_id: str = Field(min_length=1, max_length=128)
 
 
+class PaymentReservationIn(BaseModel):
+    """待付额度预约请求：在作者实际收款前预约待付额度。
+
+    - 凭全局唯一预约号 reservation_id、作者编号、当前最新关账批次号与正整数金额（分）；
+    - 可预约额 = 该批次累计应计 − 有效已付 − 同作者其他待执行预约占额（负值按零计），超额拒绝（400）；
+    - close_id 必须是当前最新关账批次（过期批次 409），作者/批次不存在分别报错（404）；
+    - 同预约号同内容重试返回原状态（200），异内容冲突（409）。
+    """
+
+    reservation_id: str = Field(min_length=1, max_length=128)
+    author_id: str = Field(min_length=1, max_length=128)
+    close_id: int = Field(gt=0)
+    amount_cents: int = Field(gt=0)
+
+
+class PaymentReservationExecuteIn(BaseModel):
+    """待执行预约执行请求：凭全局唯一付款编号执行一次。
+
+    - 仅 pending 预约可执行；已执行重复执行返回原付款（200），已取消/已失效为不允许的状态迁移（409）；
+    - 同一事务内校验批次仍为最新与余额（可付额含本预约占额），通过后登记现有付款并解除占额；
+    - payment_id 全局唯一：换付款编号重复执行同一预约冲突（409），付款编号被其他付款占用冲突（409）。
+    """
+
+    payment_id: str = Field(min_length=1, max_length=128)
+
+
 class ReconciliationReceiptIn(BaseModel):
     """渠道逐笔回单。
 

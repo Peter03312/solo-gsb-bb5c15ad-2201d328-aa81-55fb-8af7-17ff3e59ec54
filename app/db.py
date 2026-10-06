@@ -177,6 +177,37 @@ CREATE TABLE IF NOT EXISTS payment_reversals (
 );
 CREATE INDEX IF NOT EXISTS idx_payment_reversals_author ON payment_reversals(author_id);
 
+-- 待付额度预约（付款预约）：在作者实际收款前，财务凭全局唯一预约号、作者编号、
+-- 当前最新关账批次号与正整数金额（分）预约待付额度；状态机 pending → executed/cancelled/expired。
+-- reserved_cents 为预约金额（占额）；status='pending' 的预约同时计入"待执行占额"，
+-- 直接付款与新预约均须扣除，避免绕过预约。
+-- pending → executed：执行时在同一事务校验批次仍为最新与余额（可付额含本预约占额），
+--   登记一笔现有 payments 并解除占额；payment_id 全局唯一，重复执行返回原付款，换付款编号冲突。
+-- pending → cancelled：取消并释放占额；已执行/已取消/已失效不得反向转换。
+-- 新关账时旧批次 pending 预约批量置为 expired 并释放占额（expired_at_close_id 记录新批次号）；
+-- 已执行付款及后续退票仍遵循现有记录和结算口径。
+-- accrued/paid_before/reserved_before/available_cents 为创建时刻快照，幂等重放原样返回。
+CREATE TABLE IF NOT EXISTS payment_reservations (
+    reservation_id        TEXT PRIMARY KEY,
+    author_id             TEXT NOT NULL,
+    close_id              INTEGER NOT NULL REFERENCES closes(close_id),
+    amount_cents          INTEGER NOT NULL CHECK (amount_cents > 0),
+    status                TEXT NOT NULL CHECK (status IN ('pending','executed','cancelled','expired')),
+    payment_id            TEXT UNIQUE REFERENCES payments(payment_id),  -- 执行后关联付款编号
+    expired_at_close_id   INTEGER REFERENCES closes(close_id),          -- 新关账失效时的新批次号
+    accrued_cents         INTEGER NOT NULL,  -- 创建时截至预约批次的应计额
+    paid_before_cents     INTEGER NOT NULL,  -- 创建时有效已付额（付款总额 − 冲回总额）
+    reserved_before_cents INTEGER NOT NULL,  -- 创建时该作者其他待执行预约占额合计
+    available_cents       INTEGER NOT NULL,  -- 创建时可预约额（本预约创建前，负值按零）
+    fingerprint           TEXT NOT NULL,
+    created_at            TEXT NOT NULL,
+    executed_at           TEXT,
+    cancelled_at          TEXT,
+    expired_at            TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_payment_reservations_author ON payment_reservations(author_id);
+CREATE INDEX IF NOT EXISTS idx_payment_reservations_status ON payment_reservations(status);
+
 -- 净价更正：以独立流水补提/冲回各档未退册数的新旧净价版税差额，
 -- 不改写历史销售；old_net_price 为该销售的"当前更正价"（首次即原价）
 CREATE TABLE IF NOT EXISTS price_corrections (

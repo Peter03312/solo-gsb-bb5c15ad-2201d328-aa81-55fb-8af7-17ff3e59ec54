@@ -40,6 +40,21 @@
 - 原付款及其提交时快照、既有关账报表均保留不改写；后续关账不改变已登记的
   冲回快照；冲回与新付款并发时按提交顺序（同一全局锁 + 单事务）原子判定，不超付。
 
+待付额度预约（付款预约）：
+- 在作者实际收款前，财务凭全局唯一预约号、作者编号、当前最新关账批次号与正整数
+  金额（分）预约待付额度；可预约额 = 该批次累计应计 − 有效已付 − 同作者其他
+  待执行预约占额，负值按零计，超额拒绝（400）；
+- 现有直接付款也须扣除待执行预约占额（可付额 = max(应计 − 有效已付 − 待执行占额, 0)），
+  避免绕过预约；
+- 待执行预约可凭全局唯一付款编号执行一次：同一事务内校验批次仍为最新与余额
+  （可付额含本预约占额），通过后登记现有付款并解除占额；重复执行返回原付款，
+  换付款编号冲突（409）；
+- 待执行预约可取消并释放占额；已执行/已取消/已失效不得反向转换（409）；
+  同预约号同内容创建重试返回原状态，异内容冲突（409）；
+- 新关账时旧批次待执行预约批量失效（status=expired）并释放占额；已执行付款及
+  后续退票仍遵循现有记录和结算口径；
+- 作者或批次不存在、过期批次、金额非法及不允许的状态迁移均明确报错。
+
 净价更正（销售净价录错）：
 - 财务凭全局唯一更正编号、原销售编号与非负新每册净价提交更正；
 - 按原销售阶梯费率与入账时分成版本，仅对各档"未退册数"计算新旧净价的每册版税差额；
@@ -68,6 +83,8 @@ from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
 from .db import LOCK, get_conn
 from .schemas import (
     PaymentIn,
+    PaymentReservationExecuteIn,
+    PaymentReservationIn,
     PaymentReversalIn,
     PriceCorrectionIn,
     RefundIn,
@@ -1178,6 +1195,13 @@ def close_batch(request_id: str | None) -> tuple[dict, bool]:
                 "UPDATE price_delta_reversals SET close_id=? WHERE entry_seq>? AND entry_seq<=?",
                 (close_id, prev, cur_seq),
             )
+            # 新关账：旧批次的待执行预约全部失效并释放占额（同一事务、新批次号落库）。
+            # 已执行/已取消/已失效预约不动；已执行付款及后续退票仍遵循现有结算口径。
+            conn.execute(
+                "UPDATE payment_reservations SET status='expired',"
+                " expired_at_close_id=?, expired_at=? WHERE status='pending'",
+                (close_id, _utcnow()),
+            )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -1210,6 +1234,11 @@ def _close_report(conn: sqlite3.Connection, close_id: int) -> dict:
         for l in lines
         if l["type"] == "price_delta_reversal"
     )
+    # 本批关账时失效（释放占额）的旧批次待执行预约数
+    expired_reservations_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM payment_reservations WHERE expired_at_close_id=?",
+        (close_id,),
+    ).fetchone()["c"]
     return {
         "close_id": c["close_id"],
         "request_id": c["request_id"],
@@ -1237,6 +1266,8 @@ def _close_report(conn: sqlite3.Connection, close_id: int) -> dict:
         "net_royalty_cents": sales_total - refund_total,
         # 含更正与反向流水的作者净分账合计（= author_totals 之和）
         "total_author_net_cents": sales_total - refund_total + correction_total - reversal_total,
+        # 新关账时失效并释放占额的旧批次待执行预约数
+        "expired_reservations_count": expired_reservations_count,
     }
 
 
@@ -1517,6 +1548,48 @@ def _paid_cents(conn: sqlite3.Connection, author_id: str) -> int:
     return r["c"] - _reversed_cents(conn, author_id)
 
 
+def _reserved_cents(conn: sqlite3.Connection, author_id: str, exclude_id: str | None = None) -> int:
+    """同作者待执行预约占额合计（status='pending'）。
+
+    exclude_id 用于执行/重试某预约时把该预约自身的占额排除（执行时其占额即本笔付款，
+    不构成额外占用）。
+    """
+    if exclude_id is None:
+        r = conn.execute(
+            "SELECT COALESCE(SUM(amount_cents),0) AS c FROM payment_reservations"
+            " WHERE author_id=? AND status='pending'",
+            (author_id,),
+        ).fetchone()
+    else:
+        r = conn.execute(
+            "SELECT COALESCE(SUM(amount_cents),0) AS c FROM payment_reservations"
+            " WHERE author_id=? AND status='pending' AND reservation_id<>?",
+            (author_id, exclude_id),
+        ).fetchone()
+    return r["c"]
+
+
+def _available_cents(
+    conn: sqlite3.Connection,
+    author_id: str,
+    through_close_id: int,
+    exclude_reservation_id: str | None = None,
+) -> tuple[int, int, int, int]:
+    """作者在指定批次的额度口径。
+
+    返回 (accrued, paid, reserved_other, available)：
+    - accrued  截至该批次全部不可改关账快照中该作者净额之和；
+    - paid     有效已付额（付款总额 − 冲回总额）；
+    - reserved_other 同作者其他待执行预约占额（exclude_reservation_id 自身除外）；
+    - available 可预约/可付额 = max(accrued − paid − reserved_other, 0)（负值按零计）。
+    直接付款与新预约共用此口径：直接付款须扣除待执行预约占额，避免绕过预约。
+    """
+    accrued = _accrued_cents(conn, author_id, through_close_id)
+    paid = _paid_cents(conn, author_id)
+    reserved = _reserved_cents(conn, author_id, exclude_reservation_id)
+    return accrued, paid, reserved, max(accrued - paid - reserved, 0)
+
+
 def _payment_fingerprint(p: PaymentIn) -> str:
     return _fingerprint(
         {
@@ -1571,13 +1644,14 @@ def submit_payment(p: PaymentIn) -> tuple[dict, bool]:
                 raise _conflict(
                     f"关账批次 {p.close_id} 不是当前最新批次（最新为 {latest}），拒绝结算"
                 )
-            accrued = _accrued_cents(conn, p.author_id, p.close_id)
-            paid_before = _paid_cents(conn, p.author_id)
-            payable = max(accrued - paid_before, 0)
+            # 直接付款同样扣除待执行预约占额，避免绕过预约
+            accrued, paid_before, reserved, payable = _available_cents(
+                conn, p.author_id, p.close_id
+            )
             if p.amount_cents > payable:
                 raise _bad_request(
                     f"支付金额 {p.amount_cents} 分超过可付额 {payable} 分"
-                    f"（应计 {accrued} - 已付 {paid_before}）"
+                    f"（应计 {accrued} - 有效已付 {paid_before} - 待执行预约 {reserved}）"
                 )
             cur = conn.execute(
                 "INSERT INTO payments(payment_id, author_id, close_id, amount_cents,"
@@ -1613,6 +1687,295 @@ def get_payment(payment_id: str) -> dict:
         if row is None:
             raise _not_found(f"付款 {payment_id} 不存在")
         return _payment_response_from_row(row)
+
+
+# ---------------------------------------------------------------- 待付额度预约（付款预约）
+
+
+_RESERVATION_STATUS_LABELS = {
+    "pending": "待执行",
+    "executed": "已执行",
+    "cancelled": "已取消",
+    "expired": "已失效",
+}
+
+
+def _reservation_fingerprint(p: PaymentReservationIn) -> str:
+    return _fingerprint(
+        {
+            "reservation_id": p.reservation_id,
+            "author_id": p.author_id,
+            "close_id": p.close_id,
+            "amount_cents": p.amount_cents,
+        }
+    )
+
+
+def _reservation_response(conn: sqlite3.Connection, reservation_id: str) -> dict:
+    """组装预约响应：预约状态、创建时快照、关联付款与作者当前可用额（实时口径）。"""
+    r = conn.execute(
+        "SELECT * FROM payment_reservations WHERE reservation_id=?",
+        (reservation_id,),
+    ).fetchone()
+    if r is None:
+        raise _not_found(f"付款预约 {reservation_id} 不存在")
+    payment = None
+    if r["payment_id"] is not None:
+        prow = conn.execute(
+            "SELECT * FROM payments WHERE payment_id=?", (r["payment_id"],)
+        ).fetchone()
+        if prow is not None:
+            payment = _payment_response_from_row(prow)
+    # 作者当前可用额：按当前最新关账批次与全部待执行预约实时重算（无批次时各项为 0）
+    latest = _latest_close_id(conn)
+    if latest is not None:
+        cur_accrued, cur_paid, cur_reserved, cur_available = _available_cents(
+            conn, r["author_id"], latest
+        )
+    else:
+        cur_accrued, cur_paid, cur_reserved, cur_available = 0, 0, 0, 0
+    return {
+        "reservation_id": r["reservation_id"],
+        "author_id": r["author_id"],
+        "close_id": r["close_id"],
+        "amount_cents": r["amount_cents"],
+        "status": r["status"],
+        "status_label": _RESERVATION_STATUS_LABELS[r["status"]],
+        # 关联付款：仅执行后存在；为付款登记时的提交快照（现有 /payments 口径）
+        "payment_id": r["payment_id"],
+        "payment": payment,
+        "expired_at_close_id": r["expired_at_close_id"],
+        # 创建时额度快照（幂等重放原样返回，不随后续关账/付款变化）
+        "accrued_cents": r["accrued_cents"],
+        "paid_before_cents": r["paid_before_cents"],
+        "reserved_before_cents": r["reserved_before_cents"],
+        "available_cents": r["available_cents"],
+        "created_at": r["created_at"],
+        "executed_at": r["executed_at"],
+        "cancelled_at": r["cancelled_at"],
+        "expired_at": r["expired_at"],
+        # 作者当前可用额（最新批次口径；负值按零计）
+        "latest_close_id": latest,
+        "current_accrued_cents": cur_accrued,
+        "current_paid_cents": cur_paid,
+        "current_reserved_cents": cur_reserved,
+        "author_available_cents": cur_available,
+    }
+
+
+def submit_payment_reservation(p: PaymentReservationIn) -> tuple[dict, bool]:
+    """预约待付额度。返回 (预约结果, 是否新建)。"""
+    fp = _reservation_fingerprint(p)
+    with LOCK:
+        conn = get_conn()
+        # 幂等优先：同预约号同内容即使批次已不再是最新，也返回原状态
+        row = conn.execute(
+            "SELECT * FROM payment_reservations WHERE reservation_id=?",
+            (p.reservation_id,),
+        ).fetchone()
+        if row is not None:
+            if row["fingerprint"] != fp:
+                raise _conflict(f"预约号 {p.reservation_id} 已存在且内容不一致")
+            return _reservation_response(conn, p.reservation_id), False
+        if not _author_exists(conn, p.author_id):
+            raise _not_found(f"作者 {p.author_id} 不存在")
+        if conn.execute(
+            "SELECT 1 FROM closes WHERE close_id=?", (p.close_id,)
+        ).fetchone() is None:
+            raise _not_found(f"关账批次 {p.close_id} 不存在")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            latest = _latest_close_id(conn)
+            if latest is None or p.close_id != latest:
+                raise _conflict(
+                    f"关账批次 {p.close_id} 不是当前最新批次（最新为 {latest}），拒绝预约"
+                )
+            # 可预约额 = 累计应计 − 有效已付 − 同作者其他待执行预约占额（负值按零计）
+            accrued, paid, reserved_other, available = _available_cents(
+                conn, p.author_id, p.close_id
+            )
+            if p.amount_cents > available:
+                raise _bad_request(
+                    f"预约金额 {p.amount_cents} 分超过可预约额 {available} 分"
+                    f"（应计 {accrued} - 有效已付 {paid} - 待执行预约 {reserved_other}）"
+                )
+            conn.execute(
+                "INSERT INTO payment_reservations(reservation_id, author_id, close_id,"
+                " amount_cents, status, payment_id, expired_at_close_id, accrued_cents,"
+                " paid_before_cents, reserved_before_cents, available_cents, fingerprint,"
+                " created_at, executed_at, cancelled_at, expired_at)"
+                " VALUES(?,?,?,?, 'pending', NULL, NULL, ?,?,?,?,?,?, NULL, NULL, NULL)",
+                (
+                    p.reservation_id,
+                    p.author_id,
+                    p.close_id,
+                    p.amount_cents,
+                    accrued,
+                    paid,
+                    reserved_other,
+                    available,
+                    fp,
+                    _utcnow(),
+                ),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return _reservation_response(conn, p.reservation_id), True
+
+
+def execute_payment_reservation(
+    reservation_id: str, p: PaymentReservationExecuteIn
+) -> tuple[dict, bool]:
+    """凭全局唯一付款编号执行待执行预约（一次）。返回 (执行结果, 是否新建)。"""
+    with LOCK:
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT * FROM payment_reservations WHERE reservation_id=?",
+            (reservation_id,),
+        ).fetchone()
+        if row is None:
+            raise _not_found(f"付款预约 {reservation_id} 不存在")
+        # 已执行：重复执行须返回原付款；换付款编号冲突
+        if row["status"] == "executed":
+            if row["payment_id"] != p.payment_id:
+                raise _conflict(
+                    f"预约 {reservation_id} 已以付款编号 {row['payment_id']} 执行，"
+                    f"不得换付款编号 {p.payment_id} 重复执行"
+                )
+            return _reservation_response(conn, reservation_id), False
+        if row["status"] != "pending":
+            raise _conflict(
+                f"预约 {reservation_id} 当前状态为"
+                f"{_RESERVATION_STATUS_LABELS[row['status']]}，不允许执行（仅待执行预约可执行）"
+            )
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # 事务内重读状态：取消/失效可能在加锁前的最后一刻发生（状态迁移不可逆）
+            row = conn.execute(
+                "SELECT * FROM payment_reservations WHERE reservation_id=?",
+                (reservation_id,),
+            ).fetchone()
+            if row["status"] != "pending":
+                if row["status"] == "executed":
+                    if row["payment_id"] != p.payment_id:
+                        raise _conflict(
+                            f"预约 {reservation_id} 已以付款编号 {row['payment_id']} 执行，"
+                            f"不得换付款编号重复执行"
+                        )
+                    conn.commit()
+                    return _reservation_response(conn, reservation_id), False
+                raise _conflict(
+                    f"预约 {reservation_id} 当前状态为"
+                    f"{_RESERVATION_STATUS_LABELS[row['status']]}，不允许执行"
+                )
+            latest = _latest_close_id(conn)
+            if latest is None or row["close_id"] != latest:
+                raise _conflict(
+                    f"预约批次 {row['close_id']} 已不是当前最新批次"
+                    f"（最新为 {latest}），预约已不可执行"
+                )
+            # 同一事务校验余额：排除本预约自身占额（执行后即转为本笔有效已付）
+            accrued, paid, reserved_other, available = _available_cents(
+                conn, row["author_id"], latest, exclude_reservation_id=reservation_id
+            )
+            if row["amount_cents"] > available:
+                raise _bad_request(
+                    f"预约金额 {row['amount_cents']} 分超过当前可付额 {available} 分"
+                    f"（应计 {accrued} - 有效已付 {paid} - 其他待执行预约 {reserved_other}），"
+                    f"拒绝执行"
+                )
+            if conn.execute(
+                "SELECT 1 FROM payments WHERE payment_id=?", (p.payment_id,)
+            ).fetchone() is not None:
+                raise _conflict(f"付款编号 {p.payment_id} 已被占用，付款编号全局唯一")
+            payment_fp = _fingerprint(
+                {
+                    "payment_id": p.payment_id,
+                    "author_id": row["author_id"],
+                    "close_id": row["close_id"],
+                    "amount_cents": row["amount_cents"],
+                }
+            )
+            now = _utcnow()
+            conn.execute(
+                "INSERT INTO payments(payment_id, author_id, close_id, amount_cents,"
+                " accrued_cents, paid_before_cents, payable_cents, fingerprint, created_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    p.payment_id,
+                    row["author_id"],
+                    row["close_id"],
+                    row["amount_cents"],
+                    accrued,
+                    paid,
+                    available,
+                    payment_fp,
+                    now,
+                ),
+            )
+            # 登记付款与解除占额（pending → executed）在同一事务完成
+            conn.execute(
+                "UPDATE payment_reservations SET status='executed', payment_id=?,"
+                " executed_at=? WHERE reservation_id=? AND status='pending'",
+                (p.payment_id, now, reservation_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return _reservation_response(conn, reservation_id), True
+
+
+def cancel_payment_reservation(reservation_id: str) -> tuple[dict, bool]:
+    """取消待执行预约并释放占额。返回 (取消结果, 是否本次取消)。"""
+    with LOCK:
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT status FROM payment_reservations WHERE reservation_id=?",
+            (reservation_id,),
+        ).fetchone()
+        if row is None:
+            raise _not_found(f"付款预约 {reservation_id} 不存在")
+        if row["status"] == "cancelled":
+            # 已取消重复取消：幂等返回原状态（不允许反向转换的语义不变）
+            return _reservation_response(conn, reservation_id), False
+        if row["status"] != "pending":
+            raise _conflict(
+                f"预约 {reservation_id} 当前状态为"
+                f"{_RESERVATION_STATUS_LABELS[row['status']]}，不允许取消"
+                f"（仅待执行预约可取消，状态迁移不可逆）"
+            )
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT status FROM payment_reservations WHERE reservation_id=?",
+                (reservation_id,),
+            ).fetchone()
+            if row["status"] == "cancelled":
+                conn.commit()
+                return _reservation_response(conn, reservation_id), False
+            if row["status"] != "pending":
+                raise _conflict(
+                    f"预约 {reservation_id} 当前状态为"
+                    f"{_RESERVATION_STATUS_LABELS[row['status']]}，不允许取消"
+                )
+            conn.execute(
+                "UPDATE payment_reservations SET status='cancelled', cancelled_at=?"
+                " WHERE reservation_id=? AND status='pending'",
+                (_utcnow(), reservation_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return _reservation_response(conn, reservation_id), True
+
+
+def get_payment_reservation(reservation_id: str) -> dict:
+    with LOCK:
+        return _reservation_response(get_conn(), reservation_id)
 
 
 # ---------------------------------------------------------------- 付款冲回（银行退票）
@@ -1744,14 +2107,19 @@ def author_settlement(author_id: str) -> dict:
         paid = _paid_cents(conn, author_id)  # 有效已付额 = 付款总额 − 冲回总额
         latest = _latest_close_id(conn)
         accrued = cumulative  # 截至最新批次的应计额；无批次时为 0
+        # 待执行预约占额（直接付款亦扣除，避免绕过预约）；可付额按占额后口径计算
+        reserved = _reserved_cents(conn, author_id)
         return {
             "author_id": author_id,
             "latest_close_id": latest,
             "accrued_cents": accrued,
             "paid_cents": paid,
+            "reserved_cents": reserved,  # 待执行（pending）预约占额合计
             "reversed_cents": _reversed_cents(conn, author_id),  # 已冲回总额
             "negative_balance_cents": max(paid - accrued, 0),
-            "payable_cents": max(accrued - paid, 0),
+            "payable_cents": max(accrued - paid - reserved, 0),
+            # 作者当前可用额（= 可付/可预约额，已扣有效已付与待执行预约占额，负值按零）
+            "available_cents": max(accrued - paid - reserved, 0),
             "batches": per_batch,
             "payments": [
                 {
@@ -1786,6 +2154,28 @@ def author_settlement(author_id: str) -> dict:
                 for r in conn.execute(
                     "SELECT * FROM payment_reversals WHERE author_id=?"
                     " ORDER BY created_at, reversal_id",
+                    (author_id,),
+                )
+            ],
+            # 付款预约记录（含状态与关联付款编号；占额仅 status=pending 计入）
+            "reservations": [
+                {
+                    "reservation_id": r["reservation_id"],
+                    "close_id": r["close_id"],
+                    "amount_cents": r["amount_cents"],
+                    "status": r["status"],
+                    "status_label": _RESERVATION_STATUS_LABELS[r["status"]],
+                    "payment_id": r["payment_id"],
+                    "expired_at_close_id": r["expired_at_close_id"],
+                    "available_cents": r["available_cents"],
+                    "created_at": r["created_at"],
+                    "executed_at": r["executed_at"],
+                    "cancelled_at": r["cancelled_at"],
+                    "expired_at": r["expired_at"],
+                }
+                for r in conn.execute(
+                    "SELECT * FROM payment_reservations WHERE author_id=?"
+                    " ORDER BY created_at, reservation_id",
                     (author_id,),
                 )
             ],
