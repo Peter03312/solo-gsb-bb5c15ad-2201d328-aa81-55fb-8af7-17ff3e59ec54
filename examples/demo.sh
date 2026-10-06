@@ -2,6 +2,7 @@
 # 端到端调用示例：录入作品 → 销售 → 退款 → 关账 → 查看报表 → 付款结算
 #              → 作者分成版本变更 → 新版本销售/旧销售退款 → 退出作者结算
 #              → 净价更正 → 渠道对账 → 付款冲回（银行退票）→ 作品关账贡献查询
+#              → 付款预约（预占/执行/取消/关账失效）
 # 用法：BASE_URL=http://localhost:8000 ./examples/demo.sh
 set -euo pipefail
 
@@ -231,3 +232,82 @@ curl -s "$BASE/works/BOOK-1/close-contributions?from_close=2&to_close=3" | fmt
 echo "== 31. 边界示例：不存在作品 404；起点大于终点 422；未关账流水不计入 =="
 curl -s -o /dev/null -w 'no-work status: %{http_code} (404)\n' "$BASE/works/NO-SUCH-BOOK/close-contributions"
 curl -s -o /dev/null -w 'bad-range status: %{http_code} (422)\n' "$BASE/works/BOOK-1/close-contributions?from_close=3&to_close=2"
+
+echo "== 32. 付款预约：作者 A2 实际收款前预占待付额度（可预约额=应计−有效已付−待执行预约占额）=="
+# A2 历经第1批销售/退款、第3批旧销售退款（按 v1 分成）与第4批更正，累计应计 107920，尚无付款/预约
+LATEST_CLOSE=$(curl -s "$BASE/authors/A2/settlement" | python3 -c 'import sys,json; print(json.load(sys.stdin)["latest_close_id"])')
+echo "当前最新关账批次：$LATEST_CLOSE"
+curl -s -X POST "$BASE/payment-reservations" -H 'Content-Type: application/json' -d "{
+  \"reservation_id\": \"RSV-2026-10-A2-001\",
+  \"author_id\": \"A2\",
+  \"close_id\": $LATEST_CLOSE,
+  \"amount_cents\": 60000
+}" | fmt
+
+echo "== 33. 同号同内容重试 → 200 原预约；同号异内容 → 409；超额预约 → 400（剩余仅 47920）=="
+curl -s -o /dev/null -w 'replay status: %{http_code} (200)\n' -X POST "$BASE/payment-reservations" \
+  -H 'Content-Type: application/json' -d "{
+    \"reservation_id\": \"RSV-2026-10-A2-001\", \"author_id\": \"A2\",
+    \"close_id\": $LATEST_CLOSE, \"amount_cents\": 60000
+  }"
+curl -s -o /dev/null -w 'conflict status: %{http_code} (409)\n' -X POST "$BASE/payment-reservations" \
+  -H 'Content-Type: application/json' -d "{
+    \"reservation_id\": \"RSV-2026-10-A2-001\", \"author_id\": \"A2\",
+    \"close_id\": $LATEST_CLOSE, \"amount_cents\": 60001
+  }"
+curl -s -o /dev/null -w 'overbook status: %{http_code} (400)\n' -X POST "$BASE/payment-reservations" \
+  -H 'Content-Type: application/json' -d "{
+    \"reservation_id\": \"RSV-2026-10-A2-002\", \"author_id\": \"A2\",
+    \"close_id\": $LATEST_CLOSE, \"amount_cents\": 47921
+  }"
+
+echo "== 34. 直接付款被占额拦截：可用额仅 47920，付 47921 → 400（不能绕过预约）=="
+curl -s -o /dev/null -w 'direct-pay status: %{http_code} (400)\n' -X POST "$BASE/payments" \
+  -H 'Content-Type: application/json' -d "{
+    \"payment_id\": \"PAY-BYPASS-A2\", \"author_id\": \"A2\",
+    \"close_id\": $LATEST_CLOSE, \"amount_cents\": 47921
+  }"
+
+echo "== 35. 执行预约：同事务校验余额、登记付款、解除占额（付款编号全局唯一）=="
+curl -s -X POST "$BASE/payment-reservations/RSV-2026-10-A2-001/execute" \
+  -H 'Content-Type: application/json' -d '{"payment_id": "PAY-2026-10-A2-001"}' | fmt
+echo "    重复执行（同付款编号）→ 200 原付款；换付款编号 → 409"
+curl -s -o /dev/null -w 'replay-exec status: %{http_code} (200)\n' \
+  -X POST "$BASE/payment-reservations/RSV-2026-10-A2-001/execute" \
+  -H 'Content-Type: application/json' -d '{"payment_id": "PAY-2026-10-A2-001"}'
+curl -s -o /dev/null -w 'swap-payid status: %{http_code} (409)\n' \
+  -X POST "$BASE/payment-reservations/RSV-2026-10-A2-001/execute" \
+  -H 'Content-Type: application/json' -d '{"payment_id": "PAY-OTHER-ID"}'
+
+echo "== 36. 再预约一笔并取消（释放占额，幂等）；已执行/已取消不得转换 → 409 =="
+curl -s -o /dev/null -w 'reserve status: %{http_code} (201)\n' -X POST "$BASE/payment-reservations" \
+  -H 'Content-Type: application/json' -d "{
+    \"reservation_id\": \"RSV-2026-10-A2-003\", \"author_id\": \"A2\",
+    \"close_id\": $LATEST_CLOSE, \"amount_cents\": 1000
+  }"
+curl -s -X POST "$BASE/payment-reservations/RSV-2026-10-A2-003/cancel" \
+  -H 'Content-Type: application/json' -d '{"reason": "付款计划变更"}' | fmt
+curl -s -o /dev/null -w 'cancel-replay status: %{http_code} (200)\n' \
+  -X POST "$BASE/payment-reservations/RSV-2026-10-A2-003/cancel" \
+  -H 'Content-Type: application/json' -d '{}'
+curl -s -o /dev/null -w 'cancel-executed status: %{http_code} (409)\n' \
+  -X POST "$BASE/payment-reservations/RSV-2026-10-A2-001/cancel" \
+  -H 'Content-Type: application/json' -d '{}'
+
+echo "== 37. 新关账：旧批次待执行预约失效（expired_payment_reservations_count）并释放占额 =="
+curl -s -X POST "$BASE/payment-reservations" -H 'Content-Type: application/json' -d "{
+  \"reservation_id\": \"RSV-2026-10-A2-004\", \"author_id\": \"A2\",
+  \"close_id\": $LATEST_CLOSE, \"amount_cents\": 2000
+}" -o /dev/null
+curl -s -X POST "$BASE/closes" | fmt
+echo "    失效后执行/取消 → 409；同号同内容重试仍返回原状态（expired）"
+curl -s -o /dev/null -w 'exec-expired status: %{http_code} (409)\n' \
+  -X POST "$BASE/payment-reservations/RSV-2026-10-A2-004/execute" \
+  -H 'Content-Type: application/json' -d '{"payment_id": "PAY-X"}'
+curl -s -o /dev/null -w 'cancel-expired status: %{http_code} (409)\n' \
+  -X POST "$BASE/payment-reservations/RSV-2026-10-A2-004/cancel" \
+  -H 'Content-Type: application/json' -d '{}'
+
+echo "== 38. 查询预约详情与作者结算总览（reserved_cents/available_cents/reservations）=="
+curl -s "$BASE/payment-reservations/RSV-2026-10-A2-001" | fmt
+curl -s "$BASE/authors/A2/settlement" | fmt

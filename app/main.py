@@ -15,6 +15,9 @@ from .ledger import ApiError
 from .schemas import (
     CloseIn,
     PaymentIn,
+    PaymentReservationCancelIn,
+    PaymentReservationExecuteIn,
+    PaymentReservationIn,
     PaymentReversalIn,
     PriceCorrectionIn,
     ReconciliationIn,
@@ -33,8 +36,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="数字出版版税结算服务",
-    version="1.6.0",
-    description="阶梯版税计提、作者分成版本、退款冲销、净价更正、关账报表、关账后付款结算、付款冲回（银行退票）、渠道逐笔对账与作品关账贡献查询",
+    version="1.7.0",
+    description="阶梯版税计提、作者分成版本、退款冲销、净价更正、关账报表、关账后付款结算、付款预约（待付额度预占/执行/取消/关账失效）、付款冲回（银行退票）、渠道逐笔对账与作品关账贡献查询",
     lifespan=lifespan,
 )
 
@@ -75,7 +78,7 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 
 @app.get("/", summary="服务信息")
 def root():
-    return {"service": "数字出版版税结算服务", "version": "1.6.0", "docs": "/docs"}
+    return {"service": "数字出版版税结算服务", "version": "1.7.0", "docs": "/docs"}
 
 
 @app.get("/health", summary="健康检查")
@@ -235,6 +238,55 @@ def get_payment(payment_id: str):
     return ledger.get_payment(payment_id)
 
 
+# ---------------------------------------------------------------- 付款预约
+
+
+@app.post(
+    "/payment-reservations",
+    status_code=201,
+    summary="预约待付额度（全局唯一预约号；可预约额=应计−有效已付−同作者待执行预约占额）",
+)
+def create_payment_reservation(payload: PaymentReservationIn, response: Response):
+    body, created = ledger.submit_payment_reservation(payload)
+    if not created:  # 同号同内容重试 → 返回原预约状态
+        response.status_code = 200
+    return body
+
+
+@app.get(
+    "/payment-reservations/{reservation_id}",
+    summary="查询付款预约（状态、关联付款与作者当前可用额）",
+)
+def get_payment_reservation(reservation_id: str):
+    return ledger.get_payment_reservation(reservation_id)
+
+
+@app.post(
+    "/payment-reservations/{reservation_id}/execute",
+    status_code=201,
+    summary="执行付款预约（同事务校验批次与余额、登记付款并解除占额；付款编号全局唯一）",
+)
+def execute_payment_reservation(
+    reservation_id: str, payload: PaymentReservationExecuteIn, response: Response
+):
+    body, executed = ledger.execute_payment_reservation(reservation_id, payload)
+    if not executed:  # 重复执行（同付款编号）→ 返回原付款
+        response.status_code = 200
+    return body
+
+
+@app.post(
+    "/payment-reservations/{reservation_id}/cancel",
+    status_code=200,
+    summary="取消付款预约并释放占额（仅待执行可取消；重复取消返回原状态）",
+)
+def cancel_payment_reservation(
+    reservation_id: str, payload: PaymentReservationCancelIn | None = None
+):
+    body, _created = ledger.cancel_payment_reservation(reservation_id, payload)
+    return body
+
+
 # ---------------------------------------------------------------- 付款冲回（银行退票）
 
 
@@ -255,7 +307,10 @@ def get_payment_reversal(reversal_id: str):
     return ledger.get_payment_reversal(reversal_id)
 
 
-@app.get("/authors/{author_id}/settlement", summary="作者结算总览（分批应计/已付/负余额/可付/付款记录）")
+@app.get(
+    "/authors/{author_id}/settlement",
+    summary="作者结算总览（分批应计/已付/预约占额/可用额/负余额/可付/付款/预约/冲回记录）",
+)
 def get_author_settlement(author_id: str):
     return ledger.author_settlement(author_id)
 

@@ -157,6 +157,36 @@ CREATE TABLE IF NOT EXISTS payments (
 );
 CREATE INDEX IF NOT EXISTS idx_payments_author ON payments(author_id);
 
+-- 付款预约（实际付款前预占待付额度）：
+-- 状态机 pending（待执行）→ executed（已执行，关联 payment_id，终态）
+--                     ↘ canceled（主动取消，终态）
+--                     ↘ expired（新关账时旧批次待执行预约失效，终态）；
+-- 终态之间不得反向转换。占额口径：同作者 pending 预约计入占额，
+-- 可预约额/直接付款可付额均扣除占额；执行在同一事务内校验余额、登记付款并解除占额。
+-- payable_cents 为创建时刻"扣除本笔后"的可付/可用额快照；accrued_cents/paid_cents/
+-- reserved_cents 为创建时刻快照，幂等重放原样返回，不随后续关账变化。
+CREATE TABLE IF NOT EXISTS payment_reservations (
+    reservation_id   TEXT PRIMARY KEY,
+    author_id        TEXT NOT NULL,
+    close_id         INTEGER NOT NULL REFERENCES closes(close_id),
+    amount_cents     INTEGER NOT NULL CHECK (amount_cents > 0),
+    status           TEXT NOT NULL CHECK (status IN ('pending', 'executed', 'canceled', 'expired')),
+    payment_id       TEXT UNIQUE REFERENCES payments(payment_id),  -- 执行后关联的全局唯一付款编号
+    accrued_cents    INTEGER NOT NULL,  -- 创建时截至最新批次的应计额
+    paid_cents       INTEGER NOT NULL,  -- 创建时有效已付额（付款总额 − 冲回总额）
+    reserved_cents   INTEGER NOT NULL,  -- 创建时同作者其他待执行预约占额合计（不含本笔）
+    payable_cents    INTEGER NOT NULL,  -- 创建时可付额 = max(应计 − 已付 − 含本笔占额, 0)
+    cancel_reason    TEXT,
+    fingerprint      TEXT NOT NULL,
+    created_at       TEXT NOT NULL,
+    executed_at      TEXT,
+    canceled_at      TEXT,
+    expired_at       TEXT,
+    expired_close_id INTEGER REFERENCES closes(close_id)  -- 因哪一次新关账而失效
+);
+CREATE INDEX IF NOT EXISTS idx_payment_reservations_author ON payment_reservations(author_id);
+CREATE INDEX IF NOT EXISTS idx_payment_reservations_status ON payment_reservations(status);
+
 -- 付款冲回（银行退票）：凭全局唯一冲回编号对原付款整笔冲回（不支持部分冲回）；
 -- payment_id 唯一 ⇒ 每笔付款至多冲回一次；accrued/paid_before/paid_after/payable/
 -- negative_balance/latest_close_id 为登记时刻的作者结算快照（按当时最新关账批次计算），
@@ -311,7 +341,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
     - entries 的 CHECK 约束加入 net 价更正与价差反向两种新流水类型
       （SQLite 不能直接改 CHECK，按官方推荐方式重建表；在 init_db 持锁、
       且新表均以 IF NOT EXISTS 创建的前提下，外键引用安全）。
+    - payment_reservations 为新表（IF NOT EXISTS 自动建），补列仅为兼容
+      本轮开发期间创建过旧形新表的库。
     """
+    pr_cols = {r["name"] for r in conn.execute("PRAGMA table_info(payment_reservations)")}
+    if pr_cols and "expired_close_id" not in pr_cols:
+        conn.execute(
+            "ALTER TABLE payment_reservations ADD COLUMN expired_close_id INTEGER"
+            " REFERENCES closes(close_id)"
+        )
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(sales)")}
     if "split_version" not in cols:
         # 版本机制之前的销售均按初始分成计提，回填版本 1

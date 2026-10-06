@@ -124,13 +124,45 @@ class PaymentIn(BaseModel):
     """作者付款结算请求：按当前最新关账批次结算可付额。
 
     - close_id 必须是当前最新关账批次，否则拒绝（409）；
-    - amount_cents 为支付金额（分），必须为正且不超过可付额。
+    - amount_cents 为支付金额（分），必须为正且不超过可付额（扣除同作者待执行预约占额后）。
     """
 
     author_id: str = Field(min_length=1, max_length=128)
     close_id: int = Field(gt=0)
     payment_id: str = Field(min_length=1, max_length=128)
     amount_cents: int = Field(gt=0)
+
+
+class PaymentReservationIn(BaseModel):
+    """付款预约（作者实际收款前预占待付额度）：
+
+    - reservation_id 全局唯一：同号同内容重试返回原预约，同号异内容拒绝（409）；
+    - close_id 必须是当前最新关账批次（过期批次拒绝，409）；
+    - amount_cents 为预约金额（分），必须为正整数；
+    - 可预约额 = 该批次累计应计 − 有效已付 − 同作者待执行预约占额（负值按零计），超额拒绝（400）。
+    """
+
+    reservation_id: str = Field(min_length=1, max_length=128)
+    author_id: str = Field(min_length=1, max_length=128)
+    close_id: int = Field(gt=0)
+    amount_cents: int = Field(gt=0)
+
+
+class PaymentReservationExecuteIn(BaseModel):
+    """执行付款预约：待执行预约凭全局唯一付款编号执行一次（同事务校验、登记付款、解除占额）。
+
+    - payment_id 全局唯一：重复执行（同预约再次调用）返回原付款（200）；
+      换付款编号执行同一预约、或同一付款编号绑定不同预约均拒绝（409）；
+    - 已取消/已失效预约不得执行（409）。
+    """
+
+    payment_id: str = Field(min_length=1, max_length=128)
+
+
+class PaymentReservationCancelIn(BaseModel):
+    """取消付款预约（仅待执行预约可取消，取消即释放占额；幂等：重复取消返回原状态）。"""
+
+    reason: str | None = Field(default=None, max_length=500)
 
 
 class PaymentReversalIn(BaseModel):
